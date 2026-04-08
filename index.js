@@ -350,4 +350,9 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Server running on :' + PORT));
+const io = new Server(server, {
+    cors: {
+        origin: ["https://lucky-island-client-taupe.vercel.app", "http://localhost:5173"],
+        methods: ["GET", "POST"]
+    }
+});
