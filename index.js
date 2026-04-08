@@ -6,7 +6,9 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {  cors: {
+        origin: ["https://lucky-island-client-taupe.vercel.app", "http://localhost:5173"],
+        methods: ["GET", "POST"] } });
 
 const SECRET_STAFF_CODE = "lucky1004";
 let users = {};
@@ -350,9 +352,5 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const io = new Server(server, {
-    cors: {
-        origin: ["https://lucky-island-client-taupe.vercel.app", "http://localhost:5173"],
-        methods: ["GET", "POST"]
-    }
+
 });
