@@ -6,14 +6,18 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
-const io = new Server(server, {  cors: {
+const io = new Server(server, {
+    cors: {
         origin: ["https://lucky-island-client-taupe.vercel.app", "http://localhost:5173"],
-        methods: ["GET", "POST"] } });
+        methods: ["GET", "POST"]
+    }
+});
 
 const SECRET_STAFF_CODE = "lucky1004";
 let users = {};
 let gameState = { phase: 'lobby', data: null, bets: {}, selections: {}, timer: 0 };
 let timerInterval = null;
+let chatFrozen = false;
 
 function checkBeggars() {
     Object.values(users).forEach(u => { if (u.balance < 0) u.balance = 0; u.isBeggar = (u.balance <= 0); });
@@ -31,7 +35,6 @@ function emitRacingBetCounts() {
     io.emit('racingBetCounts', counts);
 }
 
-// 타이머 종료 시 미제출 유저 자동 확정
 function autoFinalizeBets() {
     Object.keys(gameState.selections).forEach(uid => {
         if (!gameState.bets[uid] && users[uid] && !users[uid].isBeggar) {
@@ -59,12 +62,10 @@ function startTimer(callback) {
 io.on('connection', (socket) => {
     socket.on('joinGame', (data) => {
         const isStaff = (data.secretCode === SECRET_STAFF_CODE) || (data.isStaff === true);
-        // 같은 닉네임의 기존 유저 찾기 (구 소켓 정리)
         const existing = Object.values(users).find(u => u.nickname === data.nickname && u.id !== socket.id);
         if (existing) {
             const oldId = existing.id;
             delete users[oldId];
-            // 구 소켓 disconnect가 새 유저를 지우지 않도록 마킹
             if (io.sockets.sockets.get(oldId)) {
                 io.sockets.sockets.get(oldId)._replaced = true;
             }
@@ -97,6 +98,7 @@ io.on('connection', (socket) => {
     socket.on('sendMessage', (text) => {
         const user = users[socket.id];
         if (!user || !text || !text.trim()) return;
+        if (chatFrozen && !user.isStaff) return;
         io.emit('receiveMessage', {
             id: Date.now() + Math.random(), senderId: user.id,
             nickname: user.nickname, profilePic: user.profilePic,
@@ -105,44 +107,46 @@ io.on('connection', (socket) => {
         });
     });
 
-    // ===== 선택 (배팅/경마 공통) =====
+    socket.on('toggleChatFreeze', () => {
+        if (!users[socket.id]?.isStaff) return;
+        chatFrozen = !chatFrozen;
+        io.emit('chatFreezeUpdate', chatFrozen);
+    });
+
     socket.on('selectChoice', (idx) => {
         if (gameState.phase === 'lobby') return;
         const user = users[socket.id];
         if (!user || user.isBeggar) return;
         gameState.selections[socket.id] = idx;
-        // 경마: 이미 제출된 배팅의 선택지도 변경 (재선택)
         if (gameState.bets[socket.id]) {
             gameState.bets[socket.id].choice = idx;
             if (gameState.phase === 'racing') emitRacingBetCounts();
         }
     });
 
-    // 배팅액 임시 저장 (자동 확정용)
     socket.on('updateBetAmount', (amt) => {
         if (gameState.phase === 'lobby') return;
         if (!gameState.pendingAmounts) gameState.pendingAmounts = {};
         gameState.pendingAmounts[socket.id] = parseInt(amt) || 0;
     });
 
-    // ===== 배팅 제출 (재제출 가능) =====
     socket.on('submitBet', (data) => {
         const user = users[socket.id];
         if (!user || user.isBeggar) return;
         if (!data.amount || data.amount <= 0 || data.amount > user.balance) return;
         if (data.choice === null || data.choice === undefined) return;
         gameState.bets[socket.id] = { choice: data.choice, amount: data.amount };
-        delete gameState.selections[socket.id]; // 확정되었으므로 선택 목록에서 제거
+        delete gameState.selections[socket.id];
         socket.emit('betConfirmed', data);
         if (gameState.phase === 'racing') emitRacingBetCounts();
     });
 
-    // ===== 배팅게임 =====
-    socket.on('startBettingGame', () => {
+    socket.on('startBettingGame', (options) => {
         if (!users[socket.id]?.isStaff) return;
+        const t = (options && options.timer && options.timer > 0) ? options.timer : 40;
         const labels = ['1번', '2번', '3번', '4번', '5번'];
-        gameState = { phase: 'betting', data: labels, bets: {}, selections: {}, pendingAmounts: {}, timer: 40 };
-        io.emit('gameStarted', { phase: 'betting', data: labels, timer: 40 });
+        gameState = { phase: 'betting', data: labels, bets: {}, selections: {}, pendingAmounts: {}, timer: t };
+        io.emit('gameStarted', { phase: 'betting', data: labels, timer: t });
         startTimer(calcBettingResults);
     });
 
@@ -170,7 +174,6 @@ io.on('connection', (socket) => {
             userResults[uid] = { effect: effects[effIdx], effectIdx: effIdx, change, betAmount: bet.amount, choice: bet.choice };
         });
 
-        // 잭팟: 2배 당첨자 중 1명 → 배팅액 5배 추가
         let jackpotUser = null;
         const twiceWinners = resultByEffect[0] || [];
         if (twiceWinners.length > 0) {
@@ -181,7 +184,6 @@ io.on('connection', (socket) => {
             jackpotUser = { ...users[luckyId], bonus };
         }
 
-        // 왕자와 거지: -50% 당첨자 중 1명 ↔ 1위 스와핑
         let swapEvent = null;
         const halfLosers = resultByEffect[4] || [];
         if (halfLosers.length > 0) {
@@ -203,11 +205,12 @@ io.on('connection', (socket) => {
         gameState.phase = 'lobby';
     }
 
-    // ===== 경마게임 =====
-    socket.on('startHorseRacing', (horses) => {
+    socket.on('startHorseRacing', (options) => {
         if (!users[socket.id]?.isStaff) return;
-        gameState = { phase: 'racing', data: horses, bets: {}, selections: {}, pendingAmounts: {}, timer: 60 };
-        io.emit('gameStarted', { phase: 'racing', data: horses, timer: 60 });
+        const horses = (options && options.horses) ? options.horses : Array(10).fill(0).map((_,i)=>`경주마${i+1}`);
+        const t = (options && options.timer && options.timer > 0) ? options.timer : 60;
+        gameState = { phase: 'racing', data: horses, bets: {}, selections: {}, pendingAmounts: {}, timer: t };
+        io.emit('gameStarted', { phase: 'racing', data: horses, timer: t });
         startTimer(calcRacingResults);
     });
 
@@ -229,7 +232,6 @@ io.on('connection', (socket) => {
             const prize = Math.floor(pool / winners.length);
             winners.forEach(uid => { users[uid].balance += prize; payouts[uid] = (payouts[uid] || 0) + prize; });
         } else if (pool > 0) {
-            // 깜짝 룰: 전체 유저 중 최저 잔액자 (거지 포함), 동률이면 랜덤 1명
             const allUsers = Object.values(users);
             if (allUsers.length > 0) {
                 const minBal = Math.min(...allUsers.map(u => u.balance));
@@ -249,7 +251,6 @@ io.on('connection', (socket) => {
         gameState.phase = 'lobby';
     }
 
-    // ===== 거지회생 =====
     socket.on('resurrectBeggars', () => {
         if (!users[socket.id]?.isStaff) return;
         let count = 0;
@@ -258,10 +259,8 @@ io.on('connection', (socket) => {
         io.emit('resurrectionEvent', { count });
     });
 
-    // ===== 운명에 맡기기 (거지 제외) =====
     socket.on('triggerFateEvent', () => {
         if (!users[socket.id]?.isStaff) return;
-        // 거지가 아닌 유저만 대상
         const ids = Object.keys(users).filter(id => !users[id].isBeggar);
         if (ids.length < 2) return;
 
@@ -341,9 +340,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        // 새로고침으로 대체된 소켓이면 무시 (새 joinGame이 이미 처리함)
         if (socket._replaced) return;
-        // 이미 다른 소켓으로 대체된 유저인지 확인
         if (users[socket.id]) {
             delete users[socket.id];
             broadcastUsers();
@@ -353,4 +350,3 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('Server running on :' + PORT));
-
